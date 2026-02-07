@@ -7,6 +7,10 @@ linters:
   default: standard
   disable:
     - depguard
+  exclusions:
+    rules:
+      - linters: [errcheck]
+        path: benchmark_test\.go
 
 formatters:
   enable:
