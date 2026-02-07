@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/bjaus/breaker"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 var errTest = errors.New("test error")
@@ -28,709 +30,587 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-func TestNew(t *testing.T) {
-	t.Run("creates circuit with defaults", func(t *testing.T) {
-		c := breaker.New("test")
-
-		if c.Name() != "test" {
-			t.Fatalf("expected name 'test', got %q", c.Name())
-		}
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed state, got %v", c.State())
-		}
-	})
-
-	t.Run("creates circuit with options", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(3),
-			breaker.WithSuccessThreshold(2),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithClock(clock),
-		)
-
-		if c.Name() != "test" {
-			t.Fatalf("expected name 'test', got %q", c.Name())
-		}
-	})
+type BreakerSuite struct {
+	suite.Suite
+	clock *fakeClock
 }
 
-func TestDo(t *testing.T) {
-	t.Run("succeeds on first attempt", func(t *testing.T) {
-		c := breaker.New("test", breaker.WithClock(newFakeClock()))
+func TestBreakerSuite(t *testing.T) {
+	suite.Run(t, new(BreakerSuite))
+}
 
+func (s *BreakerSuite) SetupTest() {
+	s.clock = newFakeClock()
+}
+
+func (s *BreakerSuite) TestNew_CreatesCircuitWithDefaults() {
+	c := breaker.New("test")
+
+	s.Equal("test", c.Name())
+	s.Equal(breaker.Closed, c.State())
+}
+
+func (s *BreakerSuite) TestNew_CreatesCircuitWithOptions() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(3),
+		breaker.WithSuccessThreshold(2),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithClock(s.clock),
+	)
+
+	s.Equal("test", c.Name())
+}
+
+func (s *BreakerSuite) TestDo_SucceedsOnFirstAttempt() {
+	c := breaker.New("test", breaker.WithClock(s.clock))
+
+	err := c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	})
+
+	s.NoError(err)
+}
+
+func (s *BreakerSuite) TestDo_ReturnsFunctionError() {
+	c := breaker.New("test", breaker.WithClock(s.clock))
+
+	err := c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	})
+
+	s.ErrorIs(err, errTest)
+}
+
+func (s *BreakerSuite) TestDo_CountsConsecutiveFailures() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(3),
+		breaker.WithClock(s.clock),
+	)
+
+	for range 2 {
+		s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+			return errTest
+		}), errTest)
+	}
+
+	s.Equal(breaker.Closed, c.State(), "expected Closed after 2 failures")
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State(), "expected Open after 3 failures")
+}
+
+func (s *BreakerSuite) TestDo_ResetsFailureCountOnSuccess() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(3),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	failures, _ := c.Counts()
+	s.Equal(2, failures)
+
+	s.NoError(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	}))
+
+	failures, _ = c.Counts()
+	s.Equal(0, failures, "expected 0 failures after success")
+}
+
+func (s *BreakerSuite) TestDo_RejectsCallsWhenOpen() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State())
+
+	called := false
+	err := c.Do(context.Background(), func(ctx context.Context) error {
+		called = true
+		return nil
+	})
+
+	s.False(called, "expected function not to be called when circuit is open")
+	s.True(breaker.IsOpen(err))
+}
+
+func (s *BreakerSuite) TestDo_RespectsContext() {
+	c := breaker.New("test", breaker.WithClock(s.clock))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := c.Do(ctx, func(ctx context.Context) error {
+		return ctx.Err()
+	})
+
+	s.ErrorIs(err, context.Canceled)
+}
+
+func (s *BreakerSuite) TestStateTransitions_ClosedToOpenAfterFailures() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(2),
+		breaker.WithClock(s.clock),
+	)
+
+	s.Equal(breaker.Closed, c.State())
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State())
+}
+
+func (s *BreakerSuite) TestStateTransitions_OpenToHalfOpenAfterDuration() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithOpenDuration(30*time.Second),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State())
+
+	s.clock.Advance(29 * time.Second)
+	s.Equal(breaker.Open, c.State(), "expected Open before duration")
+
+	s.clock.Advance(2 * time.Second)
+	s.Equal(breaker.HalfOpen, c.State(), "expected HalfOpen after duration")
+}
+
+func (s *BreakerSuite) TestStateTransitions_HalfOpenToClosedAfterSuccesses() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithSuccessThreshold(2),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithHalfOpenRequests(2),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.clock.Advance(11 * time.Second)
+
+	s.Equal(breaker.HalfOpen, c.State())
+
+	s.NoError(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	}))
+
+	s.Equal(breaker.HalfOpen, c.State(), "expected HalfOpen after 1 success")
+
+	s.NoError(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	}))
+
+	s.Equal(breaker.Closed, c.State(), "expected Closed after 2 successes")
+}
+
+func (s *BreakerSuite) TestStateTransitions_HalfOpenToOpenOnFailure() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.clock.Advance(11 * time.Second)
+
+	s.Equal(breaker.HalfOpen, c.State())
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State(), "expected Open after failure in half-open")
+}
+
+func (s *BreakerSuite) TestHalfOpenRequests_LimitsRequestsInHalfOpen() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithHalfOpenRequests(1),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.clock.Advance(11 * time.Second)
+
+	s.Equal(breaker.HalfOpen, c.State())
+
+	calls := 0
+	for range 5 {
 		err := c.Do(context.Background(), func(ctx context.Context) error {
+			calls++
 			return nil
 		})
-		if err != nil {
-			t.Fatalf("expected nil error, got %v", err)
+		if calls > 1 {
+			s.True(breaker.IsOpen(err), "expected ErrOpen for call %d", calls)
 		}
-	})
+	}
 
-	t.Run("returns function error", func(t *testing.T) {
-		c := breaker.New("test", breaker.WithClock(newFakeClock()))
+	s.Equal(1, calls, "expected 1 call allowed in half-open")
+}
 
+func (s *BreakerSuite) TestHalfOpenRequests_AllowsMultipleRequestsWhenConfigured() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithHalfOpenRequests(3),
+		breaker.WithSuccessThreshold(5),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.clock.Advance(11 * time.Second)
+
+	calls := 0
+	rejected := 0
+	for range 5 {
 		err := c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if !errors.Is(err, errTest) {
-			t.Fatalf("expected errTest, got %v", err)
-		}
-	})
-
-	t.Run("counts consecutive failures", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(3),
-			breaker.WithClock(newFakeClock()),
-		)
-
-		for range 2 {
-			_ = c.Do(context.Background(), func(ctx context.Context) error {
-				return errTest
-			})
-		}
-
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed after 2 failures, got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open after 3 failures, got %v", c.State())
-		}
-	})
-
-	t.Run("resets failure count on success", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(3),
-			breaker.WithClock(newFakeClock()),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		failures, _ := c.Counts()
-		if failures != 2 {
-			t.Fatalf("expected 2 failures, got %d", failures)
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
+			calls++
 			return nil
 		})
-
-		failures, _ = c.Counts()
-		if failures != 0 {
-			t.Fatalf("expected 0 failures after success, got %d", failures)
+		if breaker.IsOpen(err) {
+			rejected++
 		}
-	})
+	}
 
-	t.Run("rejects calls when open", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithClock(newFakeClock()),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open state, got %v", c.State())
-		}
-
-		called := false
-		err := c.Do(context.Background(), func(ctx context.Context) error {
-			called = true
-			return nil
-		})
-
-		if called {
-			t.Fatal("expected function not to be called when circuit is open")
-		}
-		if !breaker.IsOpen(err) {
-			t.Fatalf("expected ErrOpen, got %v", err)
-		}
-	})
-
-	t.Run("respects context", func(t *testing.T) {
-		c := breaker.New("test", breaker.WithClock(newFakeClock()))
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		err := c.Do(ctx, func(ctx context.Context) error {
-			return ctx.Err()
-		})
-
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected context.Canceled, got %v", err)
-		}
-	})
+	s.Equal(3, calls, "expected 3 calls allowed in half-open")
+	s.Equal(2, rejected, "expected 2 rejected")
 }
 
-func TestStateTransitions(t *testing.T) {
-	t.Run("closed to open after failures", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(2),
-			breaker.WithClock(newFakeClock()),
-		)
+func (s *BreakerSuite) TestCondition_CustomConditionDeterminesFailure() {
+	transient := errors.New("transient")
+	permanent := errors.New("permanent")
 
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed, got %v", c.State())
-		}
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(2),
+		breaker.WithClock(s.clock),
+		breaker.If(func(err error) bool {
+			return errors.Is(err, transient)
+		}),
+	)
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return permanent
+	}), permanent)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return permanent
+	}), permanent)
 
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open, got %v", c.State())
-		}
-	})
+	s.Equal(breaker.Closed, c.State(), "expected Closed (permanent errors not counted)")
 
-	t.Run("open to half-open after duration", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithOpenDuration(30*time.Second),
-			breaker.WithClock(clock),
-		)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return transient
+	}), transient)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return transient
+	}), transient)
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open, got %v", c.State())
-		}
-
-		clock.Advance(29 * time.Second)
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open before duration, got %v", c.State())
-		}
-
-		clock.Advance(2 * time.Second)
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen after duration, got %v", c.State())
-		}
-	})
-
-	t.Run("half-open to closed after successes", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithSuccessThreshold(2),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithHalfOpenRequests(2),
-			breaker.WithClock(clock),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		clock.Advance(11 * time.Second)
-
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen, got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return nil
-		})
-
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen after 1 success, got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return nil
-		})
-
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed after 2 successes, got %v", c.State())
-		}
-	})
-
-	t.Run("half-open to open on failure", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithClock(clock),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		clock.Advance(11 * time.Second)
-
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen, got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open after failure in half-open, got %v", c.State())
-		}
-	})
+	s.Equal(breaker.Open, c.State(), "expected Open after transient errors")
 }
 
-func TestHalfOpenRequests(t *testing.T) {
-	t.Run("limits requests in half-open", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithHalfOpenRequests(1),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithClock(clock),
-		)
+func (s *BreakerSuite) TestCondition_IfNotSkipsMatchingErrors() {
+	skipThis := errors.New("skip this")
+	countThis := errors.New("count this")
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		clock.Advance(11 * time.Second)
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(2),
+		breaker.WithClock(s.clock),
+		breaker.IfNot(func(err error) bool {
+			return errors.Is(err, skipThis)
+		}),
+	)
 
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen, got %v", c.State())
-		}
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return skipThis
+	}), skipThis)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return skipThis
+	}), skipThis)
 
-		calls := 0
-		for range 5 {
-			err := c.Do(context.Background(), func(ctx context.Context) error {
-				calls++
-				return nil
-			})
-			if calls > 1 && !breaker.IsOpen(err) {
-				t.Fatalf("expected ErrOpen for call %d, got %v", calls, err)
-			}
-		}
+	s.Equal(breaker.Closed, c.State(), "expected Closed (skipThis errors NOT counted)")
 
-		if calls != 1 {
-			t.Fatalf("expected 1 call allowed in half-open, got %d", calls)
-		}
-	})
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return countThis
+	}), countThis)
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return countThis
+	}), countThis)
 
-	t.Run("allows multiple requests when configured", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithHalfOpenRequests(3),
-			breaker.WithSuccessThreshold(5),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithClock(clock),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-		clock.Advance(11 * time.Second)
-
-		calls := 0
-		rejected := 0
-		for range 5 {
-			err := c.Do(context.Background(), func(ctx context.Context) error {
-				calls++
-				return nil
-			})
-			if breaker.IsOpen(err) {
-				rejected++
-			}
-		}
-
-		if calls != 3 {
-			t.Fatalf("expected 3 calls allowed in half-open, got %d", calls)
-		}
-		if rejected != 2 {
-			t.Fatalf("expected 2 rejected, got %d", rejected)
-		}
-	})
+	s.Equal(breaker.Open, c.State(), "expected Open after countThis errors")
 }
 
-func TestCondition(t *testing.T) {
-	t.Run("custom condition determines failure", func(t *testing.T) {
-		transient := errors.New("transient")
-		permanent := errors.New("permanent")
+func (s *BreakerSuite) TestCondition_NotInvertsCondition() {
+	alwaysTrue := func(err error) bool { return true }
+	alwaysFalse := func(err error) bool { return false }
 
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(2),
-			breaker.WithClock(newFakeClock()),
-			breaker.If(func(err error) bool {
-				return errors.Is(err, transient)
-			}),
-		)
+	inverted := breaker.Not(alwaysTrue)
+	s.False(inverted(errTest), "expected Not(alwaysTrue) to return false")
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return permanent
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return permanent
-		})
-
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed (permanent errors not counted), got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return transient
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return transient
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open after transient errors, got %v", c.State())
-		}
-	})
-
-	t.Run("IfNot skips matching errors", func(t *testing.T) {
-		skipThis := errors.New("skip this")
-		countThis := errors.New("count this")
-
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(2),
-			breaker.WithClock(newFakeClock()),
-			breaker.IfNot(func(err error) bool {
-				return errors.Is(err, skipThis)
-			}),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return skipThis
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return skipThis
-		})
-
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed (skipThis errors NOT counted), got %v", c.State())
-		}
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return countThis
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return countThis
-		})
-
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open after countThis errors, got %v", c.State())
-		}
-	})
-
-	t.Run("Not inverts condition", func(t *testing.T) {
-		alwaysTrue := func(err error) bool { return true }
-		alwaysFalse := func(err error) bool { return false }
-
-		inverted := breaker.Not(alwaysTrue)
-		if inverted(errTest) {
-			t.Fatal("expected Not(alwaysTrue) to return false")
-		}
-
-		inverted = breaker.Not(alwaysFalse)
-		if !inverted(errTest) {
-			t.Fatal("expected Not(alwaysFalse) to return true")
-		}
-	})
+	inverted = breaker.Not(alwaysFalse)
+	s.True(inverted(errTest), "expected Not(alwaysFalse) to return true")
 }
 
-func TestHooks(t *testing.T) {
-	t.Run("OnStateChange called on transition", func(t *testing.T) {
-		var transitions []struct {
-			name     string
-			from, to breaker.State
-		}
+func (s *BreakerSuite) TestHooks_OnStateChangeCalledOnTransition() {
+	var transitions []struct {
+		name     string
+		from, to breaker.State
+	}
 
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithClock(newFakeClock()),
-			breaker.OnStateChange(func(name string, from, to breaker.State) {
-				transitions = append(transitions, struct {
-					name     string
-					from, to breaker.State
-				}{name, from, to})
-			}),
-		)
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithClock(s.clock),
+		breaker.OnStateChange(func(name string, from, to breaker.State) {
+			transitions = append(transitions, struct {
+				name     string
+				from, to breaker.State
+			}{name, from, to})
+		}),
+	)
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
 
-		if len(transitions) != 1 {
-			t.Fatalf("expected 1 transition, got %d", len(transitions))
-		}
-		if transitions[0].name != "test" {
-			t.Fatalf("expected name 'test', got %q", transitions[0].name)
-		}
-		if transitions[0].from != breaker.Closed {
-			t.Fatalf("expected from Closed, got %v", transitions[0].from)
-		}
-		if transitions[0].to != breaker.Open {
-			t.Fatalf("expected to Open, got %v", transitions[0].to)
-		}
-	})
-
-	t.Run("OnCall called after each attempt", func(t *testing.T) {
-		var calls []struct {
-			name  string
-			state breaker.State
-			err   error
-		}
-
-		c := breaker.New("test",
-			breaker.WithClock(newFakeClock()),
-			breaker.OnCall(func(name string, state breaker.State, err error) {
-				calls = append(calls, struct {
-					name  string
-					state breaker.State
-					err   error
-				}{name, state, err})
-			}),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return nil
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		if len(calls) != 2 {
-			t.Fatalf("expected 2 calls, got %d", len(calls))
-		}
-		if calls[0].err != nil {
-			t.Fatalf("expected first call err nil, got %v", calls[0].err)
-		}
-		if !errors.Is(calls[1].err, errTest) {
-			t.Fatalf("expected second call err errTest, got %v", calls[1].err)
-		}
-	})
-
-	t.Run("OnReject called when circuit open", func(t *testing.T) {
-		var rejects []string
-
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithClock(newFakeClock()),
-			breaker.OnReject(func(name string) {
-				rejects = append(rejects, name)
-			}),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return nil
-		})
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return nil
-		})
-
-		if len(rejects) != 2 {
-			t.Fatalf("expected 2 rejects, got %d", len(rejects))
-		}
-		if rejects[0] != "test" || rejects[1] != "test" {
-			t.Fatalf("expected rejects for 'test', got %v", rejects)
-		}
-	})
+	s.Require().Len(transitions, 1)
+	s.Equal("test", transitions[0].name)
+	s.Equal(breaker.Closed, transitions[0].from)
+	s.Equal(breaker.Open, transitions[0].to)
 }
 
-func TestReset(t *testing.T) {
-	t.Run("resets circuit to closed", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithClock(newFakeClock()),
-		)
+func (s *BreakerSuite) TestHooks_OnCallCalledAfterEachAttempt() {
+	var calls []struct {
+		name  string
+		state breaker.State
+		err   error
+	}
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
+	c := breaker.New("test",
+		breaker.WithClock(s.clock),
+		breaker.OnCall(func(name string, state breaker.State, err error) {
+			calls = append(calls, struct {
+				name  string
+				state breaker.State
+				err   error
+			}{name, state, err})
+		}),
+	)
+
+	s.NoError(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	}))
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Require().Len(calls, 2)
+	s.NoError(calls[0].err)
+	s.ErrorIs(calls[1].err, errTest)
+}
+
+func (s *BreakerSuite) TestHooks_OnRejectCalledWhenCircuitOpen() {
+	var rejects []string
+
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithClock(s.clock),
+		breaker.OnReject(func(name string) {
+			rejects = append(rejects, name)
+		}),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.True(breaker.IsOpen(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	})))
+	s.True(breaker.IsOpen(c.Do(context.Background(), func(ctx context.Context) error {
+		return nil
+	})))
+
+	s.Require().Len(rejects, 2)
+	s.Equal("test", rejects[0])
+	s.Equal("test", rejects[1])
+}
+
+func (s *BreakerSuite) TestReset_ResetsCircuitToClosed() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithClock(s.clock),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	s.Equal(breaker.Open, c.State())
+
+	c.Reset()
+
+	s.Equal(breaker.Closed, c.State())
+
+	failures, successes := c.Counts()
+	s.Zero(failures)
+	s.Zero(successes)
+}
+
+func (s *BreakerSuite) TestReset_TriggersOnStateChange() {
+	var transitions []breaker.State
+
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithClock(s.clock),
+		breaker.OnStateChange(func(name string, from, to breaker.State) {
+			transitions = append(transitions, to)
+		}),
+	)
+
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+
+	c.Reset()
+
+	s.Require().Len(transitions, 2)
+	s.Equal(breaker.Closed, transitions[1])
+}
+
+func (s *BreakerSuite) TestReset_WhenAlreadyClosedIsNoOp() {
+	stateChanges := 0
+	c := breaker.New("test",
+		breaker.WithClock(s.clock),
+		breaker.OnStateChange(func(name string, from, to breaker.State) {
+			stateChanges++
+		}),
+	)
+
+	s.Equal(breaker.Closed, c.State())
+
+	c.Reset()
+
+	s.Zero(stateChanges)
+}
+
+func (s *BreakerSuite) TestCounts_TracksFailures() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(10),
+		breaker.WithClock(s.clock),
+	)
+
+	for range 3 {
+		s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
 			return errTest
-		})
+		}), errTest)
+	}
 
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open, got %v", c.State())
-		}
+	failures, successes := c.Counts()
+	s.Equal(3, failures)
+	s.Zero(successes)
+}
 
-		c.Reset()
+func (s *BreakerSuite) TestCounts_TracksSuccessesInHalfOpen() {
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithSuccessThreshold(5),
+		breaker.WithHalfOpenRequests(5),
+		breaker.WithOpenDuration(10*time.Second),
+		breaker.WithClock(s.clock),
+	)
 
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed after reset, got %v", c.State())
-		}
+	s.ErrorIs(c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
+	s.clock.Advance(11 * time.Second)
 
-		failures, successes := c.Counts()
-		if failures != 0 || successes != 0 {
-			t.Fatalf("expected counts reset to 0, got failures=%d successes=%d", failures, successes)
-		}
-	})
+	for range 3 {
+		s.NoError(c.Do(context.Background(), func(ctx context.Context) error {
+			return nil
+		}))
+	}
 
-	t.Run("reset triggers OnStateChange", func(t *testing.T) {
-		var transitions []breaker.State
-
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithClock(newFakeClock()),
-			breaker.OnStateChange(func(name string, from, to breaker.State) {
-				transitions = append(transitions, to)
-			}),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
-
-		c.Reset()
-
-		if len(transitions) != 2 {
-			t.Fatalf("expected 2 transitions, got %d", len(transitions))
-		}
-		if transitions[1] != breaker.Closed {
-			t.Fatalf("expected second transition to Closed, got %v", transitions[1])
-		}
-	})
+	_, successes := c.Counts()
+	s.Equal(3, successes)
 }
 
 func TestIsOpen(t *testing.T) {
-	t.Run("returns true for ErrOpen", func(t *testing.T) {
-		if !breaker.IsOpen(breaker.ErrOpen) {
-			t.Fatal("expected IsOpen(ErrOpen) to be true")
-		}
-	})
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"returns true for ErrOpen":      {err: breaker.ErrOpen, want: true},
+		"returns false for other error": {err: errTest, want: false},
+		"returns false for nil":         {err: nil, want: false},
+	}
 
-	t.Run("returns false for other errors", func(t *testing.T) {
-		if breaker.IsOpen(errTest) {
-			t.Fatal("expected IsOpen(errTest) to be false")
-		}
-	})
-
-	t.Run("returns false for nil", func(t *testing.T) {
-		if breaker.IsOpen(nil) {
-			t.Fatal("expected IsOpen(nil) to be false")
-		}
-	})
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.want, breaker.IsOpen(tc.err))
+		})
+	}
 }
 
 func TestState_String(t *testing.T) {
-	tests := []struct {
+	tests := map[string]struct {
 		state breaker.State
 		want  string
 	}{
-		{breaker.Closed, "closed"},
-		{breaker.Open, "open"},
-		{breaker.HalfOpen, "half-open"},
-		{breaker.State(99), "unknown"},
+		"closed":    {state: breaker.Closed, want: "closed"},
+		"open":      {state: breaker.Open, want: "open"},
+		"half-open": {state: breaker.HalfOpen, want: "half-open"},
+		"unknown":   {state: breaker.State(99), want: "unknown"},
 	}
 
-	for _, tt := range tests {
-		if got := tt.state.String(); got != tt.want {
-			t.Errorf("State(%d).String() = %q, want %q", tt.state, got, tt.want)
-		}
-	}
-}
-
-func TestCounts(t *testing.T) {
-	t.Run("tracks failures", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(10),
-			breaker.WithClock(newFakeClock()),
-		)
-
-		for range 3 {
-			_ = c.Do(context.Background(), func(ctx context.Context) error {
-				return errTest
-			})
-		}
-
-		failures, successes := c.Counts()
-		if failures != 3 {
-			t.Fatalf("expected 3 failures, got %d", failures)
-		}
-		if successes != 0 {
-			t.Fatalf("expected 0 successes, got %d", successes)
-		}
-	})
-
-	t.Run("tracks successes in half-open", func(t *testing.T) {
-		clock := newFakeClock()
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithSuccessThreshold(5),
-			breaker.WithHalfOpenRequests(5),
-			breaker.WithOpenDuration(10*time.Second),
-			breaker.WithClock(clock),
-		)
-
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.want, tc.state.String())
 		})
-		clock.Advance(11 * time.Second)
-
-		for range 3 {
-			_ = c.Do(context.Background(), func(ctx context.Context) error {
-				return nil
-			})
-		}
-
-		_, successes := c.Counts()
-		if successes != 3 {
-			t.Fatalf("expected 3 successes, got %d", successes)
-		}
-	})
-}
-
-func TestResetWhenAlreadyClosed(t *testing.T) {
-	t.Run("reset when already closed is no-op", func(t *testing.T) {
-		stateChanges := 0
-		c := breaker.New("test",
-			breaker.WithClock(newFakeClock()),
-			breaker.OnStateChange(func(name string, from, to breaker.State) {
-				stateChanges++
-			}),
-		)
-
-		if c.State() != breaker.Closed {
-			t.Fatalf("expected Closed, got %v", c.State())
-		}
-
-		c.Reset()
-
-		if stateChanges != 0 {
-			t.Fatalf("expected no state changes, got %d", stateChanges)
-		}
-	})
+	}
 }
 
 func TestRealClock(t *testing.T) {
-	t.Run("uses real clock when not injected", func(t *testing.T) {
-		c := breaker.New("test",
-			breaker.WithFailureThreshold(1),
-			breaker.WithOpenDuration(50*time.Millisecond),
-		)
+	c := breaker.New("test",
+		breaker.WithFailureThreshold(1),
+		breaker.WithOpenDuration(50*time.Millisecond),
+	)
 
-		_ = c.Do(context.Background(), func(ctx context.Context) error {
-			return errTest
-		})
+	require.ErrorIs(t, c.Do(context.Background(), func(ctx context.Context) error {
+		return errTest
+	}), errTest)
 
-		if c.State() != breaker.Open {
-			t.Fatalf("expected Open, got %v", c.State())
-		}
+	require.Equal(t, breaker.Open, c.State())
 
-		time.Sleep(60 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
 
-		if c.State() != breaker.HalfOpen {
-			t.Fatalf("expected HalfOpen after wait, got %v", c.State())
-		}
-	})
+	require.Equal(t, breaker.HalfOpen, c.State())
 }
